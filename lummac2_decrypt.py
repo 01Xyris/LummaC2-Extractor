@@ -272,7 +272,7 @@ def analyze_pe_file(file_path: str):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python pe_analyzer.py <path_to_pe_file>")
+        print("Usage: python lummac2_decrypt.py <path_to_pe_file>")
         sys.exit(1)
 
     file_path = sys.argv[1]
