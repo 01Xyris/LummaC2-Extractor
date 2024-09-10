@@ -1,201 +1,279 @@
+# xor_decrypt and extract_b64_strings are from RussianPanda (https://x.com/RussianPanda9xx). Thanks, 🐼! 
+
+
+import pefile
+import distorm3
+import binascii
+import sys
+import base64
+import json
 import re
-import argparse
-from typing import List, Optional
-from speakeasy import Speakeasy
+from collections import namedtuple
+from typing import List, Optional, Tuple
 
-__version__ = "1.0.0"
-__author__ = "Xyris"
-__github__ = "https://github.com/01Xyris/"
-__twitter__ = "https://x.com/01Xyris"
+# Constants
+MAX_ITERATIONS = 2000
+VALID_ASCII_RANGE = range(32, 127)
+TEXT_SECTION_NAME = b'.text'
+LUMMA_C2_MARKER = "LummaC2 Build:"
 
-class MemoryChunk:
-    """Represents a chunk of memory with its offset and value."""
+# Named tuple to store encrypted sequence details
+EncryptedSequence = namedtuple('EncryptedSequence', [
+    'start_address', 'encrypted_values', 'initial_key', 'key_modifier', 'decrypted_string', 'disassembly'
+])
 
-    def __init__(self, offset: int, esp_offset: int, value: int):
-        self.offset = offset
-        self.esp_offset = esp_offset
-        self.value = value
+class AnalysisState:
+    def __init__(self):
+        self.reset()
 
-class LummaC2Analyzer:
-    """Analyzes binary files for encrypted URLs in LummaC2."""
+    def reset(self, sequence_start_address=None, initial_key=None, key_modifier=None):
+        self.immediate_values = []
+        self.sequence_start_address = sequence_start_address
+        self.initial_key = initial_key
+        self.key_modifier = key_modifier
+        self.current_instructions = []
+        self.in_mov_sequence = False
+        self.first_add = None
+        self.continue_search_for_add = False
 
-    START_SEARCH = 0x400000
-    END_SEARCH = 0x500000
-    CHUNK_SIZE = 0x1000
+
+# Helper function to filter printable characters
+def sanitize_string(decoded_str: str) -> str:
+    return ''.join(filter(lambda c: 32 <= ord(c) <= 126, decoded_str))
+
+
+# Decrypts an encrypted string based on provided keys
+def decrypt_encrypted_string(encrypted_hex: str, initial_key: int, key_modifier: int, max_iterations: Optional[int] = None) -> bytearray:
+    encrypted_bytes = bytearray(binascii.unhexlify(encrypted_hex))
     
-    DECRYPT_CONSTANT_PATTERN = rb'\x0f\xb6\x4c\x0c\x10\x05'
-    DECRYPT_AL_PATTERN = rb'\x8b\x84\x24\x10\x01\x00\x00\x04'
+    # Ensure max_iterations doesn't exceed the length of encrypted_bytes
+    max_iterations = min(max_iterations or len(encrypted_bytes), len(encrypted_bytes))
+    
+    decrypted_data = bytearray()
 
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.emulator = Speakeasy()
-        self.memory_dump = bytearray()
-        self.start_address = self.START_SEARCH
-        self.decrypt_constant = None
-        self.decrypt_al = None
+    for index in range(max_iterations):
+        original_byte = encrypted_bytes[index]
+        negated_value = (~original_byte) & 0xFF
+        intermediate_value = (
+            index + original_byte + initial_key +
+            (negated_value - ((index + initial_key) | negated_value)) * 2
+        ) & 0xFFFFFFFF
+        decrypted_byte = (intermediate_value + key_modifier) & 0xFF
+        decrypted_data.append(decrypted_byte)
 
-    @staticmethod
-    def add_uint_to_buffer(buffer: bytearray, value: int) -> None:
-        """Adds an unsigned integer to a buffer in little-endian format."""
-        if value == 0:
-            buffer.append(0)
-            return
-        while value:
-            buffer.append(value & 0xFF)
-            value >>= 8
+    return decrypted_data
 
-    @classmethod
-    def encode_buffer(cls, values: List[int]) -> bytearray:
-        """Encodes a list of integers into a bytearray."""
-        buffer = bytearray()
-        for value in values:
-            cls.add_uint_to_buffer(buffer, value)
-        return buffer
 
-    def emulate_and_dump_memory(self) -> None:
-        """Emulates the binary and dumps its memory."""
-        module = self.emulator.load_module(self.file_path)
-        self.emulator.run_module(module)
-        
-        for addr in range(self.START_SEARCH, self.END_SEARCH, self.CHUNK_SIZE):
-            try:
-                chunk = self.emulator.mem_read(addr, self.CHUNK_SIZE)
-                self.memory_dump.extend(chunk)
-            except Exception:
-                pass  # Silently skip unreadable memory regions
 
-    def find_pattern_and_extract(self, pattern: bytes, bytes_to_extract: int = 4) -> Optional[int]:
-        """Finds a pattern in memory dump and extracts following bytes as an integer."""
-        match = re.search(pattern, self.memory_dump)
-        if match and match.end() + bytes_to_extract <= len(self.memory_dump):
-            start_index = match.end()
-            return int.from_bytes(self.memory_dump[start_index:start_index + bytes_to_extract], byteorder='little')
-        return None
+# Determines if a string contains meaningful characters
+def is_meaningful_string(s: str) -> bool:
+    return sum(1 for c in s if c.isalnum()) >= 2
 
-    @staticmethod
-    def find_mov_patterns(data: bytes) -> List[MemoryChunk]:
-        """Finds all MOV instruction patterns in the given data."""
-        pattern = re.compile(rb'\xC7\x44\x24([\x10-\x78])([\x00-\xFF]{4})')
-        return [MemoryChunk(match.start(), match.group(1)[0], int.from_bytes(match.group(2), byteorder='little'))
-                for match in re.finditer(pattern, data)]
 
-    def decrypt_large_block(self, data: bytes) -> bytearray:
-        """Decrypts a large block of data using extracted decrypt values."""
-        if self.decrypt_constant is None or self.decrypt_al is None:
-            raise ValueError("Decrypt values not set. Call extract_decrypt_values() first.")
-        decrypted = bytearray(data)
-        for i in range(len(decrypted)):
-            temp = (i + self.decrypt_constant) ^ decrypted[i]
-            decrypted[i] = (temp & 0xFF) + self.decrypt_al & 0xFF
-        return decrypted
+# Attempts to decode a byte sequence into a readable string using multiple encodings
+def attempt_string_decoding(data: bytes) -> Optional[str]:
+    encodings = ['utf-16', 'utf-8', 'latin1']
+    for encoding in encodings:
+        try:
+            decoded_str = sanitize_string(data.decode(encoding).strip('\x00'))
+            if is_meaningful_string(decoded_str):
+                return decoded_str
+        except UnicodeDecodeError:
+            continue
+    return None
 
-    def process_data(self, data: bytes) -> str:
-        """Processes and decrypts data, converting to a readable string."""
-        decrypted_data = self.decrypt_large_block(data)
-        return ''.join(chr(byte) if 32 <= byte <= 126 else '.' for byte in decrypted_data)
 
-    @staticmethod
-    def fix_url_string(s: str) -> str:
-        """Fixes common issues in decrypted URL strings."""
-        s = s.replace('.', '')
-        return s.replace('steamcommunitycom', 'steamcommunity.com')
+# Extracts URLs from a decoded string
+def extract_urls(data: str) -> List[str]:
+    url_pattern = re.compile(r'(https?://[^\s]+)')
+    return url_pattern.findall(data)
 
-    def extract_decrypt_values(self) -> None:
-        """Extracts decrypt values from memory dump."""
-        self.decrypt_constant = self.find_pattern_and_extract(self.DECRYPT_CONSTANT_PATTERN)
-        self.decrypt_al = self.find_pattern_and_extract(self.DECRYPT_AL_PATTERN, 1)
-        if self.decrypt_constant is None or self.decrypt_al is None:
-            raise ValueError("Failed to extract decrypt values")
 
-    @staticmethod
-    def decrypt_char(char: str) -> str:
-        """Decrypts a single character using LummaC2's algorithm."""
-        bVar18 = ord(char)
-        if (bVar18 + 0x9f) & 0xFF < 0x1a:
-            iVar11 = (bVar18 & 0x1e) - (~bVar18 & 1)
-            uVar19 = iVar11 + 0xf
-            if uVar19 > 0x19:
-                uVar19 = (iVar11 - 0xb) & 0xFF
-            bVar18 = (uVar19 + 0x61) & 0xFF
-        return chr(bVar18)
+# Extracts Base64 encoded strings from a file
+def extract_b64_strings(file_path: str, min_length: int = 60, max_length: int = 100) -> List[str]:
+    try:
+        with open(file_path, 'rb') as file:
+            file_content = file.read()
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"File not found: {file_path}") from e
 
-    @classmethod
-    def decrypt_string(cls, encrypted: str) -> str:
-        """Decrypts a string using LummaC2's algorithm."""
-        return ''.join(cls.decrypt_char(c) for c in encrypted)
+    try:
+        data = file_content.decode('utf-8')
+    except UnicodeDecodeError:
+        data = file_content.decode('latin1')
 
-    def analyze(self) -> None:
-        """Performs the main analysis of the binary file."""
-        print(f"[*] Analyzing file: {self.file_path}")
-        self.emulate_and_dump_memory()
-        if not self.memory_dump:
-            print("[!] Failed to dump memory.")
-            return
+    pattern = re.compile(r'(?:(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?)')
+    matches = pattern.findall(data)
+    return [match for match in matches if min_length <= len(match) <= max_length]
 
-        self.extract_decrypt_values()
-        mov_matches = self.find_mov_patterns(self.memory_dump)
-        self._process_chunks(mov_matches)
 
-    def _process_chunks(self, mov_matches: List[MemoryChunk]) -> None:
-        """Processes chunks of memory to find and decrypt URLs."""
-        current_chunk = []
-        chunk_start_address = self.start_address
+# Decrypts Base64-encoded data using XOR and extracts a domain or readable string
+def xor_decrypt(encoded_str: str) -> Optional[str]:
+    try:
+        dec_data = base64.b64decode(encoded_str)
+        key = dec_data[32:]
+        data = dec_data[:32]
 
-        for chunk in mov_matches:
-            if chunk.esp_offset == 0x10:
-                self._process_single_chunk(current_chunk, chunk_start_address)
-                current_chunk = []
-                chunk_start_address = self.start_address + chunk.offset
+        decrypted = bytearray(data[i] ^ key[i % len(key)] for i in range(len(data)))
 
-            if 0x10 <= chunk.esp_offset <= 0x78:
-                current_chunk.append(chunk)
+        decrypted_str = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in decrypted)
+        domain_match = re.search(r'\.[a-z]{2,8}', decrypted_str)
 
-        # Process the last chunk if it exists
-        self._process_single_chunk(current_chunk, chunk_start_address)
+        if domain_match:
+            return decrypted_str[:domain_match.end()]
+        return decrypted_str
+    except Exception as e:
+        raise ValueError(f"Error decrypting data: {e}")
 
-    def _process_single_chunk(self, chunk: List[MemoryChunk], start_address: int) -> None:
-        """Processes a single chunk of memory, decrypting and displaying URLs if found."""
-        if not chunk:
-            return
 
-        chunk_values = [c.value for c in chunk]
-        chunk_data = self.encode_buffer(chunk_values)
-        decrypted_string = self.process_data(chunk_data)
+# Parses an instruction and extracts relevant details
+def parse_instruction(instruction) -> Tuple[bool, bool, List[str], str]:
+    is_memory_dword = any(op.type == distorm3.OPERAND_MEMORY and op.size == 32 for op in instruction.operands)
+    has_immediate_value = any(op.type == distorm3.OPERAND_IMMEDIATE for op in instruction.operands)
 
-        if decrypted_string.startswith('h.t.t.p.s'):
-            print("\n[+] Found encrypted URL:")
-            for c in chunk:
-                print(f"    Offset 0x{self.start_address + c.offset:08x}: ESP+0x{c.esp_offset:02x} -> 0x{c.value:08x}")
+    little_endian_immediates = [get_little_endian_hex(op.value) for op in instruction.operands if op.type == distorm3.OPERAND_IMMEDIATE]
+    formatted_operands = ', '.join(format_operand(op) for op in instruction.operands)
 
-            fixed_string = self.fix_url_string(decrypted_string)
-            print(f"\n[+] Decrypted URL: {fixed_string}")
+    return is_memory_dword, has_immediate_value, little_endian_immediates, formatted_operands
 
-            steam_name = input("Enter the SteamName to decrypt (or press Enter to skip): ").strip()
-            if steam_name:
-                decrypted_name = self.decrypt_string(steam_name)
-                print(f"\n[+] Final URL: {decrypted_name}")
+
+# Helper to format operands
+def format_operand(operand) -> str:
+    if operand.type == distorm3.OPERAND_MEMORY and operand.size == 32:
+        return f"[{operand.base} + 0x{operand.disp:X}]"
+    elif operand.type == distorm3.OPERAND_REGISTER:
+        return f"{operand.name}"
+    elif operand.type == distorm3.OPERAND_IMMEDIATE:
+        return f"0x{operand.value:X}"
+    return ""
+
+
+# Converts a value into a little-endian hex representation
+def get_little_endian_hex(value: int) -> str:
+    if value < 0:
+        return ""
+    little_endian_bytes = value.to_bytes(4, byteorder='little')
+    return ''.join(f'{b:02x}' for b in little_endian_bytes)
+
+
+# Processes an instruction and updates the analysis state accordingly
+def process_instruction(instruction, state: AnalysisState):
+    is_memory_dword, has_immediate_value, little_endian_immediates, formatted_operands = parse_instruction(instruction)
+    state.current_instructions.append(f"{hex(instruction.address)}: {instruction.mnemonic} {formatted_operands}")
+
+    if instruction.mnemonic == 'MOV' and is_memory_dword and has_immediate_value:
+        if not state.sequence_start_address:
+            state.sequence_start_address = instruction.address
+        state.immediate_values.extend(little_endian_immediates)
+        state.in_mov_sequence = True
+
+    elif instruction.mnemonic == 'ADD' and len(instruction.operands) > 1 and state.in_mov_sequence:
+        if state.initial_key is None and instruction.operands[1].type == distorm3.OPERAND_IMMEDIATE:
+            state.initial_key = instruction.operands[1].value
+            state.first_add = instruction.operands[1].value
+        elif state.key_modifier is None and instruction.operands[1].type == distorm3.OPERAND_IMMEDIATE:
+            if state.first_add is not None and state.first_add != instruction.operands[1].value:
+                state.key_modifier = instruction.operands[1].value
+                state.continue_search_for_add = False
             else:
-                print("\n[!] SteamName decryption skipped.")
+                state.continue_search_for_add = True
 
-def print_credits() -> None:
-    """Prints the credits information."""
-    print(f"LummaC2 Extractor v{__version__}")
-    print(f"Author: {__author__}")
-    print(f"GitHub: {__github__}")
-    print(f"Twitter: {__twitter__}")
-    print("=" * 40)
+    if state.continue_search_for_add:
+        if instruction.mnemonic == 'ADD' and len(instruction.operands) > 1:
+            if instruction.operands[1].type == distorm3.OPERAND_IMMEDIATE and instruction.operands[1].value != state.first_add:
+                state.key_modifier = instruction.operands[1].value
+                state.continue_search_for_add = False
 
-def main() -> None:
-    """Main function to run the LummaC2 Binary Analyzer."""
-    parser = argparse.ArgumentParser(description="LummaC2 Extractor")
-    parser.add_argument("file_path", help="Path to the binary file to analyze")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    args = parser.parse_args()
 
-    print_credits()
+# Analyzes a potential encrypted sequence and extracts URLs, if present
+def analyze_potential_encrypted_sequence(state: AnalysisState, c2_urls: List[str], asm_file: str = 'strings.asm') -> Optional[EncryptedSequence]:
+    state.immediate_values = [val for val in state.immediate_values if val != '00000000']
+    if state.immediate_values:
+        encrypted_string = ''.join(state.immediate_values)
 
-    analyzer = LummaC2Analyzer(args.file_path)
-    analyzer.analyze()
+        # Ensure Initial Key is at least 2 bytes (16 bits, 4 hex digits)
+        if state.initial_key is not None and len(hex(state.initial_key)[2:]) >= 4:
+            decrypted_data = decrypt_encrypted_string(encrypted_string, state.initial_key, state.key_modifier, MAX_ITERATIONS)
+            decoded_string = attempt_string_decoding(decrypted_data)
+
+            if decoded_string:
+                # Check for "LummaC2 Build:" in the decoded string
+                if LUMMA_C2_MARKER in decoded_string:
+                    build_info = decoded_string.split(LUMMA_C2_MARKER)[-1].strip()
+                    lumma_c2_json = json.dumps({"Version": build_info}, indent=4)
+                    print("\nExtracted LummaC2 Build Info:\n", lumma_c2_json)
+
+                # Extract URLs from the decrypted string
+                urls = extract_urls(decoded_string)
+                if urls:
+                    c2_urls.extend(urls)
+                    return EncryptedSequence(
+                        start_address=hex(state.sequence_start_address),
+                        encrypted_values=state.immediate_values,
+                        initial_key=hex(state.initial_key),
+                        key_modifier=hex(state.key_modifier),
+                        decrypted_string=decoded_string + "\nExtracted URLs: " + ", ".join(urls),
+                        disassembly=state.current_instructions
+                    )
+                else:
+                    with open(asm_file, 'a', encoding='utf-8') as asm_file_obj:
+                        asm_file_obj.write(f"Start Address: {hex(state.sequence_start_address)}\n")
+                        asm_file_obj.write(f"Initial Key: {hex(state.initial_key)}\n")
+                        asm_file_obj.write(f"Key Modifier: {hex(state.key_modifier)}\n")
+                        asm_file_obj.write(f"Decrypted String: {decoded_string}\n")
+                        asm_file_obj.write("\n" + "-"*50 + "\n\n")
+    return None
+
+
+# Analyzes a PE section and extracts potential encrypted sequences
+def analyze_pe_section(binary_data: bytes, base_address: int, c2_urls: List[str]) -> List[EncryptedSequence]:
+    disassembler = distorm3.DecomposeGenerator(base_address, binary_data, distorm3.Decode32Bits)
+    state = AnalysisState()
+    encrypted_sequences = []
+
+    for instruction in disassembler:
+        if not instruction.valid:
+            continue
+        process_instruction(instruction, state)
+
+        if state.immediate_values and state.initial_key is not None and state.key_modifier is not None:
+            sequence = analyze_potential_encrypted_sequence(state, c2_urls)
+            if sequence:
+                encrypted_sequences.append(sequence)
+            state.reset()
+
+    return encrypted_sequences
+
+
+# Analyzes the given PE file for encrypted sequences and Base64-encoded data
+def analyze_pe_file(file_path: str):
+    pe = pefile.PE(file_path)
+    text_section = next(section for section in pe.sections if TEXT_SECTION_NAME in section.Name)
+    section_start = pe.OPTIONAL_HEADER.ImageBase + text_section.VirtualAddress
+    section_end = section_start + text_section.Misc_VirtualSize
+    pe_image = pe.get_memory_mapped_image()
+    section_data = pe_image[section_start - pe.OPTIONAL_HEADER.ImageBase: section_end - pe.OPTIONAL_HEADER.ImageBase]
+
+    print(f"Analyzing .text section: {hex(section_start)} - {hex(section_end)}")
+
+    c2_urls = []
+    encrypted_sequences = analyze_pe_section(section_data, section_start, c2_urls)
+
+    base64_strs = extract_b64_strings(file_path)
+    for encoded_str in base64_strs:
+        result = xor_decrypt(encoded_str)
+        if result:
+            c2_urls.append(f"URL: {result}")
+
+    if c2_urls:
+        json_output = json.dumps(c2_urls, indent=4)
+        print("\nDecrypted C2 URLs:\n", json_output)
+
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        print("Usage: python pe_analyzer.py <path_to_pe_file>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    analyze_pe_file(file_path)
